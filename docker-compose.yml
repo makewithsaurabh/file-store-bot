@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  filebot:
+    build: .
+    container_name: file-store-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - FILES_CHANNEL_ID=${FILES_CHANNEL_ID}
+      - LOGS_CHANNEL_ID=${LOGS_CHANNEL_ID}
+      - BACKUP_CHANNEL_LINK=${BACKUP_CHANNEL_LINK}
+      - ADMIN_USER_IDS=${ADMIN_USER_IDS}
+    volumes:
+      - ./data:/app/data
