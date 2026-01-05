@@ -176,65 +176,61 @@ class MessageManager:
         return list(self.messages.keys())
 
 class FileStorage:
-    def __init__(self):
-        self.cache = self.load_cache()
+    """Channel-based storage - no local cache needed"""
+    def __init__(self, bot_application=None):
+        self.bot = None
+        self.cache = {}  # Temporary in-memory cache for current session
+        logger.info("FileStorage initialized - using channel-based storage")
     
-    def load_cache(self):
-        """Load local cache for faster lookups"""
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, 'r') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                logger.error("Cache file corrupted, starting fresh")
-                return {}
-        return {}
+    def set_bot(self, bot):
+        """Set bot instance for channel operations"""
+        self.bot = bot
     
-    def save_cache(self):
-        """Save cache to local file"""
+    async def get_file_from_channel(self, unique_id):
+        """Retrieve file metadata from logs channel by searching messages"""
         try:
-            with open(CACHE_FILE, 'w') as f:
-                json.dump(self.cache, f, indent=2)
+            # Search through recent messages in logs channel
+            async for message in self.bot.get_chat(LOGS_CHANNEL_ID).iter_history(limit=1000):
+                if message.text and f"`{unique_id}`" in message.text:
+                    # Extract JSON from message
+                    if "```json" in message.text:
+                        json_start = message.text.find("```json") + 7
+                        json_end = message.text.find("```", json_start)
+                        json_str = message.text[json_start:json_end].strip()
+                        file_data = json.loads(json_str)
+                        return file_data
+            return None
         except Exception as e:
-            logger.error(f"Error saving cache: {e}")
+            logger.error(f"Error retrieving file from channel: {e}")
+            return None
     
-    def add_to_cache(self, unique_id, file_data):
-        """Add file data to local cache"""
+    async def add_to_cache(self, unique_id, file_data):
+        """Add file data to memory cache (channel logging handled separately)"""
         self.cache[unique_id] = file_data
-        self.save_cache()
-        logger.info(f"Added file {unique_id} to cache")
+        logger.info(f"Added file {unique_id} to memory cache")
     
     def get_from_cache(self, unique_id):
-        """Get file data from cache"""
+        """Get file data from memory cache"""
         return self.cache.get(unique_id)
     
-    def update_downloads(self, unique_id):
-        """Update download count in cache"""
+    async def update_downloads(self, unique_id):
+        """Update download count - just increment in memory"""
         if unique_id in self.cache:
             self.cache[unique_id]['downloads'] = self.cache[unique_id].get('downloads', 0) + 1
-            self.save_cache()
             logger.info(f"Updated download count for {unique_id}")
     
-    def delete_from_cache(self, unique_id):
-        """Delete file from cache"""
-        if unique_id in self.cache:
-            del self.cache[unique_id]
-            self.save_cache()
-            logger.info(f"Deleted file {unique_id} from cache")
-            return True
-        return False
-    
     def get_user_files(self, user_id):
-        """Get all files uploaded by a specific user"""
+        """Get all files uploaded by a specific user from memory cache"""
         return [(uid, data) for uid, data in self.cache.items() if data.get('uploader_id') == user_id]
     
     def get_all_files(self):
-        """Get all files in the system"""
+        """Get all files in memory cache"""
         return list(self.cache.items())
     
     def get_total_downloads(self):
-        """Get total downloads across all files"""
+        """Get total downloads across all files in memory"""
         return sum(data.get('downloads', 0) for data in self.cache.values())
+
 
 # Initialize storage
 storage = FileStorage()
@@ -357,6 +353,42 @@ async def log_to_channel(context, log_data):
         logger.info(f"Logged file {log_data['unique_id']} to logs channel")
     except Exception as e:
         logger.error(f"Error logging to channel: {e}")
+
+async def log_download_activity(context, file_id, file_name, downloader_user):
+    """Log download activity with detailed user information"""
+    try:
+        download_log = {
+            'file_id': file_id,
+            'file_name': file_name,
+            'downloader_id': downloader_user.id,
+            'downloader_username': downloader_user.username,
+            'downloader_first_name': downloader_user.first_name,
+            'downloader_last_name': downloader_user.last_name,
+            'download_timestamp': datetime.now().isoformat()
+        }
+        
+        download_json = json.dumps(download_log, indent=2, ensure_ascii=False)
+        
+        log_text = (
+            f"📥 *Download Activity*\n\n"
+            f"🆔 *File ID:* `{file_id}`\n"
+            f"📄 *File:* `{file_name}`\n\n"
+            f"👤 *Downloader Info:*\n"
+            f"├ *User ID:* `{downloader_user.id}`\n"
+            f"├ *Username:* @{downloader_user.username or 'N/A'}\n"
+            f"├ *Name:* {downloader_user.first_name} {downloader_user.last_name or ''}\n"
+            f"└ *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"```json\n{download_json}\n```"
+        )
+        
+        await context.bot.send_message(
+            chat_id=LOGS_CHANNEL_ID,
+            text=log_text,
+            parse_mode='Markdown'
+        )
+        logger.info(f"Logged download activity for file {file_id} by user {downloader_user.id}")
+    except Exception as e:
+        logger.error(f"Error logging download activity: {e}")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle received files and generate shareable links."""
@@ -573,14 +605,10 @@ async def handle_start_parameter(update: Update, context: ContextTypes.DEFAULT_T
         success = await send_file_to_user(context, update.effective_chat.id, file_data, unique_id)
         
         if success:
-            storage.update_downloads(unique_id)
+            await storage.update_downloads(unique_id)
             
-            # Log download activity
-            await context.bot.send_message(
-                chat_id=LOGS_CHANNEL_ID,
-                text=f"📥 *Download Activity*\n🆔 File: `{unique_id}`\n👤 User: {update.effective_user.id} (Admin)\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                parse_mode='Markdown'
-            )
+            # Log download activity with detailed user info
+            await log_download_activity(context, unique_id, file_data['file_name'], update.effective_user)
         else:
             await update.message.reply_text("❌ Error retrieving file. Please try again.")
 
@@ -755,7 +783,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"└ Cache Status: {'✅ Healthy' if len(storage.cache) > 0 else '⚠️ Empty'}"
             )
         else:
-            # User statistics
+            # User statistics - only show personal stats
             user_files = storage.get_user_files(user_id)
             user_downloads = sum(d.get('downloads', 0) for _, d in user_files)
             
@@ -765,10 +793,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"├ 📁 Files Uploaded: {len(user_files)}\n"
                 f"├ 📥 Total Downloads: {user_downloads}\n"
                 f"└ 📈 Avg Downloads/File: {user_downloads/len(user_files) if len(user_files) > 0 else 0:.1f}\n\n"
-                f"*Bot Global:*\n"
-                f"├ 📁 Total Files: {total_files}\n"
-                f"├ 📥 Total Downloads: {total_downloads}\n"
-                f"└ 👥 Active Users: {len(set(d.get('uploader_id') for d in storage.cache.values()))}"
+                f"💡 *Tip:* Upload more files to track your sharing activity!"
             )
         
         await query.edit_message_text(
@@ -965,7 +990,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success = await send_file_to_user(context, query.message.chat_id, file_data, unique_id)
         
         if success:
-            storage.update_downloads(unique_id)
+            await storage.update_downloads(unique_id)
             
             # Show join channel button after sending
             keyboard = [
@@ -983,19 +1008,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup
             )
             
-            # Log download activity
-            await context.bot.send_message(
-                chat_id=LOGS_CHANNEL_ID,
-                text=(
-                    f"📥 *Download Activity*\n\n"
-                    f"🆔 File ID: `{unique_id}`\n"
-                    f"📄 File: `{file_data['file_name']}`\n"
-                    f"👤 User: {user_id}\n"
-                    f"👤 Username: @{query.from_user.username or 'N/A'}\n"
-                    f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                ),
-                parse_mode='Markdown'
-            )
+            # Log download activity with detailed user info
+            await log_download_activity(context, unique_id, file_data['file_name'], query.from_user)
         else:
             await query.edit_message_text(
                 "❌ *Error Sending File*\n\n"
@@ -1016,22 +1030,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success = await send_file_to_user(context, query.message.chat_id, file_data, unique_id)
         
         if success:
-            storage.update_downloads(unique_id)
+            await storage.update_downloads(unique_id)
             await query.answer("✅ File sent successfully!", show_alert=False)
             
-            # Log download
-            await context.bot.send_message(
-                chat_id=LOGS_CHANNEL_ID,
-                text=(
-                    f"📥 *Download Activity*\n\n"
-                    f"🆔 File ID: `{unique_id}`\n"
-                    f"📄 File: `{file_data['file_name']}`\n"
-                    f"👤 User: {user_id}\n"
-                    f"👤 Username: @{query.from_user.username or 'N/A'}\n"
-                    f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                ),
-                parse_mode='Markdown'
-            )
+            # Log download activity with detailed user info
+            await log_download_activity(context, unique_id, file_data['file_name'], query.from_user)
         else:
             await query.answer("❌ Error sending file. Please try again.", show_alert=True)
         return
@@ -1115,7 +1118,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"└ Cache Status: {'✅ Healthy' if len(storage.cache) > 0 else '⚠️ Empty'}"
         )
     else:
-        # User statistics
+        # User statistics - only show personal stats
         user_files = storage.get_user_files(user_id)
         user_downloads = sum(d.get('downloads', 0) for _, d in user_files)
         
@@ -1125,10 +1128,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"├ 📁 Files Uploaded: {len(user_files)}\n"
             f"├ 📥 Total Downloads: {user_downloads}\n"
             f"└ 📈 Avg Downloads/File: {user_downloads/len(user_files) if len(user_files) > 0 else 0:.1f}\n\n"
-            f"*Bot Global:*\n"
-            f"├ 📁 Total Files: {total_files}\n"
-            f"├ 📥 Total Downloads: {total_downloads}\n"
-            f"└ 👥 Active Users: {len(set(d.get('uploader_id') for d in storage.cache.values()))}"
+            f"💡 *Tip:* Upload more files to track your sharing activity!"
         )
     
     await update.message.reply_text(response, parse_mode='Markdown')
